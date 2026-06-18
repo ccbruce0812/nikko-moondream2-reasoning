@@ -1,208 +1,220 @@
-# Moondream2 在 Jetson Orin Nano 上的部署與推論流程
+# Moondream2 on Jetson Orin Nano — Unified Deployment Guide
 
-## 系統需求
+## Overview
 
-| 項目 | 規格 |
-|------|------|
-| 硬體 | NVIDIA Jetson Orin Nano |
-| 系統 | JetPack 6.2.1 (r36.4.7, L4T) |
-| CUDA | 12.6 |
+Two proven inference paths for running moondream2 (1.75B VLM) on NVIDIA Jetson Orin Nano:
+
+| | HuggingFace Transformers | llama.cpp GGUF |
+|---|---|---|
+| **Model format** | HF safetensors (FP16) | GGUF q4_k quantized |
+| **Speed** | 6–10 tok/s | **32.8 tok/s** |
+| **Memory** | ~4.36 GB | **~2.0 GB** |
+| **Load time** | ~50 s | **~1.4 s** (mmap) |
+| **Best for** | One-shot validation, prototyping | Frequent inference, production |
+
+**Recommendation: GGUF q4_k** — 3–5× faster, 2× less memory, near-instant load.
+
+---
+
+## Prerequisites
+
+| Item | Spec |
+|---|---|
+| Hardware | NVIDIA Jetson Orin Nano (8 GB) |
+| System | JetPack 6.x (L4T 36.4), CUDA 12.6 |
 | Python | 3.10.12 |
-| 記憶體 | 建議 8GB+（含 swap） |
+| Storage | >6 GB free (HF) / >2 GB free (GGUF) |
 
-## 前置準備
-
-### 1. SSH 免密碼登入
+### SSH & SCP setup (for remote deployment)
 
 ```bash
 ssh-keygen -t ed25519
 ssh-copy-id brucehsu@192.168.1.119
 ```
 
-### 2. SCP 免密碼傳輸（與 SSH 共用金鑰）
-
-```bash
-ssh brucehsu@192.168.1.119 'mkdir ~/project'
-scp ~/project/* brucehsu@192.168.1.119:~/project/
-```
-
-### 3. sudo 免密碼
+### Sudo without password
 
 ```bash
 sudo visudo -f /etc/sudoers.d/brucehsu
-# 加入：
-# brucehsu  ALL=(ALL:ALL) NOPASSWD: ALL
+# Add: brucehsu  ALL=(ALL:ALL) NOPASSWD: ALL
 ```
 
-### 4. SD 卡掛載與 symlink
+---
 
-外接 SD 卡掛載於 `/media/brucehsu/e5ff97fd-3586-4584-942a-34bd2d978d27`
+## Path A: llama.cpp GGUF (Recommended)
 
-需要建立 symlink 將常用目錄指向 SD 卡（避免 rootfs 爆滿）：
-
-```bash
-SD=/media/brucehsu/e5ff97fd-3586-4584-942a-34bd2d978d27
-for d in .config .cache .local project; do
-    rm -rf ~/"$d"
-    mkdir -p "$SD/$d"
-    ln -s "$SD/$d" ~/"$d"
-done
-```
-
-## 步驟 1：建立 venv
+### 1. Create venv and install dependencies
 
 ```bash
-sudo apt-get update -y
-sudo apt-get upgrade -y
-sudo apt-get install python-pip python3-venv curl wget -y
 cd ~/project
-rm -rf venv                    # 清除舊環境（如有）
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install "numpy<2"
+```
+
+### 2. Install llama-cpp-python with CUDA support
+
+```bash
+# Install build tools first
+pip install scikit-build-core cmake ninja
+
+# Set CUDA path (Jetson default: /usr/local/cuda)
+export PATH=/usr/local/cuda/bin:$PATH
+export CUDACXX=/usr/local/cuda/bin/nvcc
+
+# Install with CUDA acceleration
+CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --upgrade --force-reinstall --no-cache-dir
+```
+
+### 3. Verify CUDA
+
+```bash
+python cuda_check_script.py
+# Should show: ✅ PyTorch CUDA + ✅ llama-cpp CUDA
+```
+
+### 4. Download model files
+
+```bash
+pip install huggingface_hub
+
+# Option A: Fixed download from salivosa/moondream2-gguf (q4_k)
+python gguf/download_gguf.py
+
+# Option B: Smart search (auto-finds best q4/int8 repo, avoids f16 OOM)
+python gguf/moondream_gguf_download_q4.py
+```
+
+Files downloaded to `~/project/gguf/moondream2/`:
+- `moondream2-mmproj-f16.gguf` (~868 MB) — vision encoder (SigLIP, always FP16)
+- `moondream2-q4_k.gguf` (~877 MB) — text model (4-bit quantized)
+
+### 5. Run inference
+
+```bash
+python gguf/moondream2_gguf.py test.jpg "Describe this image in detail."
+```
+
+### 6. Memory cleanup before inference (if OOM)
+
+```bash
+sudo sync && sudo sysctl -w vm.drop_caches=3
+sudo sysctl -w vm.compact_memory=1
+```
+
+---
+
+## Path B: HuggingFace Transformers
+
+### 1. System packages + libcusparseLt + venv
+
+```bash
+sudo apt-get update -y && sudo apt-get upgrade -y
+sudo apt-get install -y python3-pip python3-venv curl wget
+
+# libcusparseLt MUST be installed BEFORE PyTorch
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/libcusparselt0-cuda-12_0.8.1.1-1_arm64.deb
+sudo dpkg -i libcusparselt0-cuda-12_0.8.1.1-1_arm64.deb
+echo "/usr/lib/aarch64-linux-gnu/libcusparseLt/12" | sudo tee /etc/ld.so.conf.d/cusparselt.conf
+sudo ldconfig
+
+cd ~/project
+rm -rf venv
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip setuptools wheel
 ```
 
-## 步驟 2：安裝基礎依賴
+### 2. Install Jetson PyTorch
+
+```bash
+# DO NOT use pip install torch — must use NVIDIA's Jetson wheel
+wget https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
+pip install torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
+
+python3 -c "import torch; assert torch.cuda.is_available(); print('CUDA OK')"
+```
+
+### 3. Install base packages
 
 ```bash
 pip install numpy==1.26.4
-pip install einops Pillow accelerate
+pip install einops Pillow
+pip install --no-deps accelerate       # avoid pulling generic PyTorch
+pip install psutil pyyaml huggingface-hub safetensors
 ```
 
-## 步驟 3：安裝 Jetson 專用 Torch
-
-PyTorch 必須使用 NVIDIA 為 Jetson 編譯的版本（aarch64 + CUDA），
-不可使用 PyPI 通用版。
+### 4. Install torchvision + NMS patch
 
 ```bash
-# 下載 Jetson Torch wheel (JetPack 6.x)
-wget https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
-
-# 安裝
-pip install torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
-```
-
-## 步驟 4：安裝 libcusparseLt（CUDA 稀疏矩陣庫）
-
-Jetson CUDA 12.6 預設不含 libcusparseLt，需手動安裝：
-
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/libcusparselt0-cuda-12_0.8.1.1-1_arm64.deb
-sudo dpkg -i libcusparselt0-cuda-12_0.8.1.1-1_arm64.deb
-
-# 加入 ld 搜尋路徑
-echo "/usr/lib/aarch64-linux-gnu/libcusparseLt/12" | sudo tee /etc/ld.so.conf.d/cusparselt.conf
-sudo ldconfig
-```
-
-## 步驟 5：安裝 torchvision
-
-由於通用版 torchvision 與 Jetson Torch 不相容，需安裝預編 binary 後手動修補：
-
-```bash
-# 以 --no-deps 安裝（避免拉入通用版 torch）
 pip install --no-deps torchvision==0.20.1
 
-# 修補 _meta_registrations.py，繞過 nms operator 不相容問題
-# 找到 '@torch.library.register_fake("torchvision::nms")'
-# 改成如下
-#
-#try:
-#    @torch.library.register_fake("torchvision::nms")
-#    def meta_nms(dets, scores, iou_threshold):
-#        torch._check(dets.dim() == 2, lambda: f"boxes should be a 2d tensor, got {dets.dim()}D")
-#        torch._check(dets.size(1) == 4, lambda: f"boxes should have 4 elements in dimension 1, got {dets.size(1)}")
-#        torch._check(scores.dim() == 1, lambda: f"scores should be a 1d tensor, got {scores.dim()}")
-#        torch._check(
-#            dets.size(0) == scores.size(0),
-#            lambda: f"boxes and scores should have same number of elements in dimension 0, got {dets.size(0)} and {scores.size(0)}",
-#        )
-#        ctx = torch._custom_ops.get_ctx()
-#        num_to_keep = ctx.create_unbacked_symint()
-#        return dets.new_empty(num_to_keep, dtype=torch.long)
-#except RuntimeError:
-#    pass
-cp _meta_registrations.py  venv/lib/python3.10/site-packages/torchvision/_meta_registrations.py
+# Patch _meta_registrations.py: wraps nms register_fake in try/except
+# (the C++ nms operator doesn't exist in Jetson's torchvision build)
+cp huggingface/_meta_registrations.py venv/lib/python3.10/site-packages/torchvision/_meta_registrations.py
 ```
 
-## 步驟 6：安裝 transformers（指定版本）
-
-必須使用與 moondream2 模型 revision `2024-04-02` 相容的版本：
+### 5. Install transformers (pinned version)
 
 ```bash
 pip install transformers==4.40.0
+# DO NOT use transformers >= 5.x — incompatible with torch 2.5.0a0
 ```
 
-## 步驟 7：準備推論程式
-
-`moondream2.py`：
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from PIL import Image
-import torch
-
-model = AutoModelForCausalLM.from_pretrained(
-    "vikhyatk/moondream2",
-    trust_remote_code=True,
-    device_map="cuda",
-    torch_dtype=torch.float16,
-    revision="2024-04-02"
-)
-tokenizer = AutoTokenizer.from_pretrained("vikhyatk/moondream2", revision="2024-04-02")
-
-image = Image.open("test.jpg")
-image_embeds = model.encode_image(image)
-
-result = model.answer_question(image_embeds, "describe this image", tokenizer)
-print(result)
-```
-
-## 步驟 8：執行推論
+### 6. Download model & run inference
 
 ```bash
-cd ~/project
-source venv/bin/activate
-python moondream2.py test.jpg
+python huggingface/moondream2.py test.jpg "Describe this image in detail."
 ```
 
-## 預期輸出
+---
 
-```
-A cheetah, with its distinctive brown and black spotted coat, is perched on a rock
-in a dry grassland. The cheetah's body is oriented towards the right side of the
-image, and its tail is slightly raised, suggesting alertness or anticipation.
-The background is a vast expanse of dry grassland, with a few trees and bushes
-visible in the distance.
-```
+## Troubleshooting
 
-## 驗收方式
+| Problem | Cause | Solution |
+|---|---|---|
+| `libcusparseLt.so.0: cannot open` | CUDA 12.6 lacks cuSPARSELt | Install `libcusparselt0-cuda-12` deb (Path B Step 1) |
+| `operator torchvision::nms does not exist` | C++ extension mismatch | Apply NMS patch (Path B Step 4) |
+| `module 'torch' has no attribute 'float8_e8m0fnu'` | transformers 5.x + torch 2.5 | Pin `transformers==4.40.0` |
+| GGUF produces 0-token / garbled output | Wrong chat handler | Use `MoondreamChatHandler`, NOT `Llava15ChatHandler` |
+| OOM during GGUF inference | Not enough free memory | Reboot + drop_caches + compact_memory (Path A Step 6) |
+| `llama-cpp-python` install fails | Missing build tools | Install cmake, ninja, scikit-build-core first |
+| `pip install` permission error | pip cache on external drive | Set `TMPDIR=~/project/tmp` or remove symlinked cache |
 
-```bash
-# 1. 刪除環境
-rm -rf ~/project/venv
+---
 
-# 2. 重建
-python3 -m venv ~/project/venv
-source ~/project/venv/bin/activate
+## File Reference
 
-# 3. 依照以上步驟 2~8 重新執行
+### `gguf/`
+| File | Purpose |
+|---|---|
+| `README.md` | CUDA verification + install + OOM troubleshooting |
+| `download_gguf.py` | Fixed download from `salivosa/moondream2-gguf` (q4_k) |
+| `moondream_gguf_download_q4.py` | Smart search — prioritizes q4/int8, excludes f16 |
+| `moondream_gguf_download_f16.py` | Smart search — any quantization, Orin-optimized |
+| `moondream2_gguf.py` | Inference with full performance report (streaming) |
+| `test_moondream_display.py` | Camera capture + VLM inference |
+| `cuda_check_script.py` | PyTorch + llama-cpp CUDA detection |
 
-# 4. 執行推論確認成功
-python moondream2-1.py test.jpg
-```
+### `huggingface/`
+| File | Purpose |
+|---|---|
+| `readme.md` | Original 8-step deployment guide |
+| `install.sh` | Self-contained one-shot installation script |
+| `moondream2.py` | Inference with performance benchmarking |
+| `performance.md` | HF FP16 detailed performance report |
+| `comparison.md` | Four-way comparison (kestrel/HF/compile/TensorRT) |
+| `log.md` | Full deployment log |
+| `test.jpg` | Test image |
 
-## 常見問題與解法
+---
 
-| 問題 | 原因 | 解法 |
-|------|------|------|
-| `libcusparseLt.so.0: cannot open` | CUDA 12.6 未含 cuSPARSELt | 手動安裝 `libcusparselt0-cuda-12` deb |
-| `operator torchvision::nms does not exist` | torchvision binary 與 Jetson Torch 不相容 | 修補 `_meta_registrations.py` 跳過 nms |
-| `module 'torch' has no attribute 'float8_e8m0fnu'` | transformers 5.x 不相容 torch 2.5 | 降級至 `transformers==4.40.0` |
-| `torch._C._distributed_c10d` | Jetson Torch 缺分布式模組 | 修補 `fsdp.py` 中的 `is_fsdp_managed_module` |
-| `IndexError: index is out of bounds` | transformers 版本過新 | 使用 `transformers==4.40.0` |
-| 磁碟空間不足 | pip 快取占用 rootfs | 設定 `TMPDIR=~/project/tmp` 指向 SD 卡 |
+## Key Architectural Notes
 
-## 已安裝套件清單
-
-參考 `pip freeze` 輸出（已記錄在執行環境中）。
+- **Model**: vikhyatk/moondream2, revision `2024-04-02`, ~1.75B params
+- **Vision encoder**: SigLIP ViT (27 layers, dim=1152, 413M params)
+- **Text decoder**: Phi-2 based (24 layers, dim=2048, 1.31B params)
+- **Chat template** (GGUF): `<image>\n\nQuestion: ...\n\nAnswer:`
+- **GGUF handler**: MUST use `MoondreamChatHandler` — `Llava15ChatHandler` produces garbled output
+- **Precision**: mmproj is always FP16; text model is q4_k (GGUF) or FP16 (HF)
